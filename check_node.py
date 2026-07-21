@@ -11,6 +11,7 @@ watchdog mismo sigue vivo. Estado persistido en state.json (commiteado por el
 workflow; sirve tambien de keepalive del cron de GitHub).
 """
 
+import html
 import json
 import os
 import sys
@@ -28,7 +29,8 @@ NEAR_RPCS = [
     "https://1rpc.io/near",
 ]
 GNOSIS_VALIDATORS = "363043,363044,363045"
-GNOSIS_API = f"https://gnosischa.in/api/v1/validator/{GNOSIS_VALIDATORS}"
+GNOSIS_API = ("https://rpc-gbc.gnosischain.com/eth/v1/beacon/states/head/validators"
+              f"?id={GNOSIS_VALIDATORS}")
 PRODUCTION_RATIO_MIN = 0.85  # debajo de esto se considera degradado
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 REALERT_HOURS = 24
@@ -78,23 +80,36 @@ def check_near():
     return "UNKNOWN", f"ningun RPC de NEAR respondio ({last_err})"
 
 
-def check_gnosis():
-    """Devuelve (estado, detalle). Estados: OK, OFFLINE, UNKNOWN."""
+def check_gnosis(prev_balance):
+    """Devuelve (estado, detalle, balance_total). Estados: OK, OFFLINE, UNKNOWN.
+
+    Un validador que atesta gana saldo; uno caido lo pierde. Se marca OFFLINE
+    solo si el saldo cae por debajo del effective_balance Y sigue bajando, para
+    no confundirlo con los retiros periodicos del excedente.
+    """
     try:
-        r = http_json(GNOSIS_API)
-        data = r.get("data")
-        if data is None:
-            return "UNKNOWN", "respuesta sin data de gnosischa.in"
+        data = http_json(GNOSIS_API).get("data")
+        if not data:
+            return "UNKNOWN", "respuesta sin datos del beacon de Gnosis", None
         if isinstance(data, dict):
             data = [data]
-        offline = [str(v.get("validatorindex")) for v in data
-                   if "offline" in str(v.get("status", ""))]
-        total = len(data)
-        if offline:
-            return "OFFLINE", f"{len(offline)}/{total} offline (indices: {', '.join(offline)})"
-        return "OK", f"{total}/{total} validadores online"
+
+        raros = [f"{v['index']}:{v['status']}" for v in data
+                 if v.get("status") != "active_ongoing"]
+        if raros:
+            return "OFFLINE", "estado inesperado -> " + ", ".join(raros), None
+
+        total = sum(int(v["balance"]) for v in data)
+        efectivo = sum(int(v["validator"]["effective_balance"]) for v in data)
+        gno = total / 1e9 / 32  # mGwei -> mGNO -> GNO (32 mGNO = 1 GNO)
+        detalle = f"{len(data)}/{len(data)} activos, saldo {gno:.4f} GNO"
+
+        if total < efectivo and prev_balance and total < prev_balance:
+            perdida = (prev_balance - total) / 1e9 / 32
+            return "OFFLINE", f"{detalle} - perdiendo saldo ({perdida:.5f} GNO desde el ultimo chequeo)", total
+        return "OK", detalle, total
     except Exception as e:  # noqa: BLE001
-        return "UNKNOWN", f"error consultando gnosischa.in ({e})"
+        return "UNKNOWN", f"error consultando el beacon de Gnosis ({e})", None
 
 
 def send_telegram(text):
@@ -134,22 +149,27 @@ ICON = {"OK": "\U0001F7E2", "DEGRADED": "\U0001F7E1", "NOT_IN_SET": "\U0001F534"
 
 def main():
     now = datetime.now(timezone.utc)
-    near_state, near_detail = check_near()
-    gnosis_state, gnosis_detail = check_gnosis()
-
     prev = load_state()
+
+    near_state, near_detail = check_near()
+    gnosis_state, gnosis_detail, gnosis_balance = check_gnosis(prev.get("gnosis_balance"))
+
+    # UNKNOWN = no pudimos consultar; no es una falla del nodo. Se conserva el
+    # ultimo estado conocido para no alertar por caidas de las APIs publicas.
     prev_near = prev.get("near", "")
     prev_gnosis = prev.get("gnosis", "")
+    near_cmp = prev_near if near_state == "UNKNOWN" and prev_near else near_state
+    gnosis_cmp = prev_gnosis if gnosis_state == "UNKNOWN" and prev_gnosis else gnosis_state
 
     lines = [
-        f"{ICON[near_state]} <b>NEAR</b> ({NEAR_POOL}): {near_state} - {near_detail}",
-        f"{ICON[gnosis_state]} <b>Gnosis</b>: {gnosis_state} - {gnosis_detail}",
+        f"{ICON[near_state]} <b>NEAR</b> ({NEAR_POOL}): {near_state} - {html.escape(near_detail)}",
+        f"{ICON[gnosis_state]} <b>Gnosis</b>: {gnosis_state} - {html.escape(gnosis_detail)}",
     ]
     body = "\n".join(lines)
     print(body)
 
-    problem = near_state not in ("OK",) or gnosis_state not in ("OK",)
-    changed = (near_state != prev_near) or (gnosis_state != prev_gnosis)
+    problem = near_cmp in ("DEGRADED", "NOT_IN_SET") or gnosis_cmp == "OFFLINE"
+    changed = (near_cmp != prev_near) or (gnosis_cmp != prev_gnosis)
 
     last_alert = prev.get("last_alert")
     hours_since_alert = REALERT_HOURS + 1
@@ -174,8 +194,9 @@ def main():
         send_telegram(f"<b>\U0001F4CB Resumen semanal del watchdog</b>\n{body}")
 
     state = {
-        "near": near_state,
-        "gnosis": gnosis_state,
+        "near": near_cmp,
+        "gnosis": gnosis_cmp,
+        "gnosis_balance": gnosis_balance if gnosis_balance else prev.get("gnosis_balance"),
         "last_alert": now.isoformat() if alerted else prev.get("last_alert", ""),
         "last_run_date": now.strftime("%Y-%m-%d"),  # cambia 1 vez al dia -> keepalive
     }
