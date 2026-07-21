@@ -14,6 +14,7 @@ workflow; sirve tambien de keepalive del cron de GitHub).
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -101,9 +102,16 @@ def send_telegram(text):
         print("AVISO: faltan TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID; no se envia alerta")
         print(text)
         return
-    http_json(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", {
-        "chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-    })
+    try:
+        http_json(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", {
+            "chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+        })
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"ERROR Telegram: HTTP {e.code} - {body}")
+        print("Revisa los secrets: TELEGRAM_BOT_TOKEN (formato 123456789:AA..., "
+              "sin espacios ni comillas) y TELEGRAM_CHAT_ID (solo el numero).")
+        sys.exit(1)
 
 
 def load_state():
