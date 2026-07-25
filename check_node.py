@@ -80,36 +80,47 @@ def check_near():
     return "UNKNOWN", f"ningun RPC de NEAR respondio ({last_err})"
 
 
-def check_gnosis(prev_balance):
-    """Devuelve (estado, detalle, balance_total). Estados: OK, OFFLINE, UNKNOWN.
+def check_gnosis(prev_balance, dec_streak):
+    """Devuelve (estado, detalle, balance_total, racha_de_bajadas).
 
-    Un validador que atesta gana saldo; uno caido lo pierde. Se marca OFFLINE
-    solo si el saldo cae por debajo del effective_balance Y sigue bajando, para
-    no confundirlo con los retiros periodicos del excedente.
+    Un validador EN LINEA gana saldo cada epoca (~16 min en Gnosis); uno CAIDO
+    lo pierde cada epoca. Por eso una bajada de saldo entre chequeos delata que
+    los validadores no estan atestando. Un retiro del excedente tambien baja el
+    saldo, pero es un evento unico: al chequeo siguiente el saldo vuelve a subir.
+    Para no confundirlos, se marca OFFLINE solo tras DOS bajadas consecutivas.
+    Estados: OK, OFFLINE, UNKNOWN.
     """
     try:
         data = http_json(GNOSIS_API).get("data")
         if not data:
-            return "UNKNOWN", "respuesta sin datos del beacon de Gnosis", None
+            return "UNKNOWN", "respuesta sin datos del beacon de Gnosis", None, dec_streak
         if isinstance(data, dict):
             data = [data]
 
         raros = [f"{v['index']}:{v['status']}" for v in data
                  if v.get("status") != "active_ongoing"]
         if raros:
-            return "OFFLINE", "estado inesperado -> " + ", ".join(raros), None
+            # exited / slashed / pending: falla inmediata, no depende del saldo
+            return "OFFLINE", "estado inesperado -> " + ", ".join(raros), None, 0
 
         total = sum(int(v["balance"]) for v in data)
-        efectivo = sum(int(v["validator"]["effective_balance"]) for v in data)
         gno = total / 1e9 / 32  # mGwei -> mGNO -> GNO (32 mGNO = 1 GNO)
         detalle = f"{len(data)}/{len(data)} activos, saldo {gno:.4f} GNO"
 
-        if total < efectivo and prev_balance and total < prev_balance:
+        # margen de ruido: ignora variaciones minimas (~1 epoca de premio)
+        NOISE = 200_000  # en las mismas unidades del beacon (~1e-7 GNO)
+        if prev_balance and total < prev_balance - NOISE:
+            streak = dec_streak + 1
             perdida = (prev_balance - total) / 1e9 / 32
-            return "OFFLINE", f"{detalle} - perdiendo saldo ({perdida:.5f} GNO desde el ultimo chequeo)", total
-        return "OK", detalle, total
+            if streak >= 2:
+                return ("OFFLINE",
+                        f"{detalle} - saldo bajando {streak} chequeos seguidos "
+                        f"(-{perdida:.5f} GNO el ultimo)", total, streak)
+            # primera bajada: aun podria ser un retiro; avisa sin alarmar
+            return "OK", f"{detalle} - saldo bajo una vez (vigilando)", total, streak
+        return "OK", detalle, total, 0
     except Exception as e:  # noqa: BLE001
-        return "UNKNOWN", f"error consultando el beacon de Gnosis ({e})", None
+        return "UNKNOWN", f"error consultando el beacon de Gnosis ({e})", None, dec_streak
 
 
 def send_telegram(text):
@@ -152,7 +163,8 @@ def main():
     prev = load_state()
 
     near_state, near_detail = check_near()
-    gnosis_state, gnosis_detail, gnosis_balance = check_gnosis(prev.get("gnosis_balance"))
+    gnosis_state, gnosis_detail, gnosis_balance, gnosis_streak = check_gnosis(
+        prev.get("gnosis_balance"), prev.get("gnosis_dec_streak", 0))
 
     # UNKNOWN = no pudimos consultar; no es una falla del nodo. Se conserva el
     # ultimo estado conocido para no alertar por caidas de las APIs publicas.
@@ -197,6 +209,7 @@ def main():
         "near": near_cmp,
         "gnosis": gnosis_cmp,
         "gnosis_balance": gnosis_balance if gnosis_balance else prev.get("gnosis_balance"),
+        "gnosis_dec_streak": gnosis_streak,
         "last_alert": now.isoformat() if alerted else prev.get("last_alert", ""),
         "last_run_date": now.strftime("%Y-%m-%d"),  # cambia 1 vez al dia -> keepalive
     }

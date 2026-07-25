@@ -8,7 +8,19 @@ GitHub Actions cada ~15 minutos y alerta por Telegram.
 | Red | Chequeo | Fuente |
 |---|---|---|
 | NEAR | `monterrey.pool.near` en el set activo y produciendo >=85% de bloques/chunks esperados | RPC publico (`validators`) |
-| Gnosis | Validadores 363043-363045 en `active_ongoing` y sin perder saldo (un validador caido se penaliza cada epoca) | Beacon API de `rpc-gbc.gnosischain.com` |
+| Gnosis | Validadores 363043-363045 en `active_ongoing` y sin perder saldo **dos chequeos seguidos** (un validador caido se penaliza cada epoca; un retiro baja el saldo una sola vez) | Beacon API de `rpc-gbc.gnosischain.com` |
+
+### Limites de deteccion (importante)
+- **Latencia por-red.** La deteccion mira las *consecuencias on-chain* de una
+  caida, que tardan: NEAR mantiene el asiento durante toda la epoca en curso
+  (~12 h), asi que una caida de NEAR puede tardar hasta ~medio dia en verse.
+  Gnosis se ve mas rapido (~2 epocas = ~30 min de saldo bajando).
+- **Cadencia real ~1-2 h en el fork.** GitHub estrangula los crons de forks:
+  aunque el YAML pide cada 15 min, corre cada 60-120 min. Para caidas de horas
+  o dias (los incidentes reales) es suficiente. Correrlo en el repo de origen
+  (cuenta desbloqueada) mejora la cadencia.
+- Para deteccion en minutos haria falta un "hombre muerto" (latido desde el
+  nodo); pendiente si se necesita.
 
 Detecta tanto caidas del host como fallas de un solo servicio (p. ej. el nodo
 NEAR aislado sin peers), porque mira lo que la red ve, no lo que el servidor
