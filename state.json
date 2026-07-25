@@ -1,7 +1,8 @@
 {
-  "near": "OK",
+  "near": "NOT_IN_SET",
   "gnosis": "OK",
-  "gnosis_balance": 95253937818,
-  "last_alert": "2026-07-21T20:09:15.914260+00:00",
+  "gnosis_balance": 95252073817,
+  "gnosis_dec_streak": 1,
+  "last_alert": "2026-07-25T04:12:48.710715+00:00",
   "last_run_date": "2026-07-25"
 }
