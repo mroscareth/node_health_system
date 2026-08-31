@@ -1,8 +1,8 @@
 {
   "near": "OK",
-  "gnosis": "OFFLINE",
-  "gnosis_balance": 96011796717,
-  "gnosis_dec_streak": 5,
-  "last_alert": "2026-08-30T19:34:08.872311+00:00",
-  "last_run_date": "2026-08-30"
+  "gnosis": "OK",
+  "gnosis_balance": 96012194741,
+  "gnosis_dec_streak": 0,
+  "last_alert": "2026-08-31T00:34:07.161502+00:00",
+  "last_run_date": "2026-08-31"
 }
