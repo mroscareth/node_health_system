@@ -7,8 +7,8 @@ GitHub Actions cada ~15 minutos y alerta por Telegram.
 
 | Red | Chequeo | Fuente |
 |---|---|---|
-| NEAR | `monterrey.pool.near` en el set activo y produciendo >=85% de bloques/chunks esperados | RPC publico (`validators`) |
-| Gnosis | Validadores 363043-363045 en `active_ongoing` y sin perder saldo **dos chequeos seguidos** (un validador caido se penaliza cada epoca; un retiro baja el saldo una sola vez) | Beacon API de `rpc-gbc.gnosischain.com` |
+| NEAR | `monterrey.pool.near` en el set activo con ratio de **endorsements** >= 90 % (bajo eso la epoca paga cero). Solo alerta si ademas queda >5 puntos bajo la mediana de la red, para no confundir una congestion general con una falla propia. Avisa tambien si el pool queda fuera del set una epoca | RPC publico (`validators`) |
+| Gnosis | Validadores 363043-363045 en `active_ongoing` y sin perder saldo **dos chequeos seguidos**, comparando cada validador. Una bajada que deja el saldo en ~32.000x es el **barrido automatico de retiros** (credenciales 0x01) y no cuenta como caida | Beacon API de `rpc-gbc.gnosischain.com` |
 
 ### Limites de deteccion (importante)
 - **Latencia por-red.** La deteccion mira las *consecuencias on-chain* de una
