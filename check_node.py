@@ -2,8 +2,10 @@
 """Watchdog de validadores via datos on-chain publicos.
 
 Revisa:
-  - NEAR: que monterrey.pool.near este en el set activo y produciendo bloques/chunks.
-  - Gnosis: que los validadores 363043-363045 esten online (atestando).
+  - NEAR: que monterrey.pool.near este en el set activo y con su ratio de
+    endorsements por encima del umbral de pago (comparado con la red).
+  - Gnosis: que los validadores 363043-363045 esten online (atestando),
+    sin confundir el barrido automatico de retiros con una caida.
 
 Alerta por Telegram solo en cambios de estado (con recordatorio cada 24h si
 sigue mal) y manda un resumen semanal los lunes para confirmar que el
@@ -31,7 +33,15 @@ NEAR_RPCS = [
 GNOSIS_VALIDATORS = "363043,363044,363045"
 GNOSIS_API = ("https://rpc-gbc.gnosischain.com/eth/v1/beacon/states/head/validators"
               f"?id={GNOSIS_VALIDATORS}")
-PRODUCTION_RATIO_MIN = 0.85  # debajo de esto se considera degradado
+# NEAR: bajo 90% de endorsements la epoca paga cero
+NEAR_RATIO_MIN = 0.90
+NEAR_GAP_VS_MEDIAN = 0.05   # y ademas 5 puntos bajo la mediana de la red
+NEAR_MIN_EXPECTED = 2000    # no juzgar con muy pocos datos (~6% de epoca)
+NEAR_NETWORK_HEALTHY = 0.97  # mediana normal de la red: ~99.5%
+# Gnosis: el barrido de retiros parciales deja cada saldo en 32 + lo ganado desde
+# entonces. Una bajada que cae en esta franja es un retiro, no una penalizacion.
+GNOSIS_MAX_EFFECTIVE = 32_000_000_000
+GNOSIS_SWEEP_BAND = 5_000_000          # 0.005 de margen (~1 dia de premios)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 REALERT_HOURS = 24
 
@@ -49,8 +59,27 @@ def http_json(url, payload=None, timeout=25):
         return json.loads(resp.read().decode())
 
 
+def _work(v):
+    """(producido, esperado) sumando bloques, chunks y endorsements.
+
+    El pool es chunk validator: no produce bloques ni chunks, su trabajo son los
+    endorsements, y su ratio es lo que decide el pago (<90% = cero esa epoca).
+    """
+    keys = ("blocks", "chunks", "endorsements")
+    prod = sum(v.get(f"num_produced_{k}", 0) for k in keys)
+    expc = sum(v.get(f"num_expected_{k}", 0) for k in keys)
+    return prod, expc
+
+
 def check_near():
-    """Devuelve (estado, detalle). Estados: OK, DEGRADED, NOT_IN_SET, UNKNOWN."""
+    """Devuelve (estado, detalle).
+
+    Estados: OK, DEGRADED, OUT_THIS_EPOCH, NOT_IN_SET, UNKNOWN.
+
+    DEGRADED solo si el ratio cae bajo el umbral de pago Y queda claramente por
+    debajo de la mediana de la red: cuando un shard se congestiona, todos los
+    validadores bajan a la vez y eso no es una falla de nuestro nodo.
+    """
     last_err = None
     for rpc in NEAR_RPCS:
         try:
@@ -60,35 +89,50 @@ def check_near():
             result = r.get("result")
             if not result:
                 continue
-            for v in result.get("current_validators", []):
-                if v.get("account_id") == NEAR_POOL:
-                    prod = v.get("num_produced_blocks", 0) + v.get("num_produced_chunks", 0)
-                    expc = v.get("num_expected_blocks", 0) + v.get("num_expected_chunks", 0)
-                    if expc == 0:
-                        return "OK", "en el set, sin bloques esperados aun en esta epoca"
-                    ratio = prod / expc
-                    detail = f"produccion {prod}/{expc} ({ratio:.0%})"
-                    if ratio < PRODUCTION_RATIO_MIN:
-                        return "DEGRADED", detail
-                    return "OK", detail
+            current = result.get("current_validators", [])
+            ratios = sorted(p / e for p, e in map(_work, current) if e > 0)
+            median = ratios[len(ratios) // 2] if ratios else None
+            for v in current:
+                if v.get("account_id") != NEAR_POOL:
+                    continue
+                prod, expc = _work(v)
+                if expc < NEAR_MIN_EXPECTED:
+                    return "OK", f"en el set, aun pocos datos en esta epoca ({prod}/{expc})"
+                ratio = prod / expc
+                detail = f"endorsements {ratio:.2%} en esta epoca"
+                if median is not None:
+                    detail += f" (mediana de la red {median:.2%})"
+                if (ratio < NEAR_RATIO_MIN and median is not None
+                        and median - ratio > NEAR_GAP_VS_MEDIAN):
+                    detail += " - bajo el umbral de pago"
+                    if median < NEAR_NETWORK_HEALTHY:
+                        detail += "; la red tambien esta congestionada"
+                    return "DEGRADED", detail
+                return "OK", detail
             nxt = [v.get("account_id") for v in result.get("next_validators", [])]
             if NEAR_POOL in nxt:
-                return "OK", "fuera del set actual pero entra en la proxima epoca"
+                return ("OUT_THIS_EPOCH",
+                        "fuera del set esta epoca (no cobra); ya figura en la proxima")
             return "NOT_IN_SET", "no aparece en el set de validadores ni en el proximo"
         except Exception as e:  # noqa: BLE001 - probar siguiente RPC
             last_err = e
     return "UNKNOWN", f"ningun RPC de NEAR respondio ({last_err})"
 
 
-def check_gnosis(prev_balance, dec_streak):
-    """Devuelve (estado, detalle, balance_total, racha_de_bajadas).
+def _swept(balance):
+    """True si el saldo quedo justo sobre 32: huella del barrido de retiros."""
+    return GNOSIS_MAX_EFFECTIVE <= balance <= GNOSIS_MAX_EFFECTIVE + GNOSIS_SWEEP_BAND
 
-    Un validador EN LINEA gana saldo cada epoca (~16 min en Gnosis); uno CAIDO
-    lo pierde cada epoca. Por eso una bajada de saldo entre chequeos delata que
-    los validadores no estan atestando. Un retiro del excedente tambien baja el
-    saldo, pero es un evento unico: al chequeo siguiente el saldo vuelve a subir.
-    Para no confundirlos, se marca OFFLINE solo tras DOS bajadas consecutivas.
-    Estados: OK, OFFLINE, UNKNOWN.
+
+def check_gnosis(prev_balances, dec_streak):
+    """Devuelve (estado, detalle, saldos_por_validador, racha_de_bajadas).
+
+    Un validador EN LINEA gana saldo cada epoca; uno CAIDO lo pierde. Se compara
+    cada validador contra el chequeo anterior. Una bajada que deja el saldo en
+    ~32.000x es el barrido automatico de retiros (credenciales 0x01), no una
+    penalizacion: los validadores consecutivos se barren casi juntos, y antes eso
+    disparaba falsas alarmas. Se marca OFFLINE tras DOS chequeos seguidos con
+    alguna bajada real. Estados: OK, OFFLINE, UNKNOWN.
     """
     try:
         data = http_json(GNOSIS_API).get("data")
@@ -103,22 +147,39 @@ def check_gnosis(prev_balance, dec_streak):
             # exited / slashed / pending: falla inmediata, no depende del saldo
             return "OFFLINE", "estado inesperado -> " + ", ".join(raros), None, 0
 
-        total = sum(int(v["balance"]) for v in data)
+        balances = {str(v["index"]): int(v["balance"]) for v in data}
+        total = sum(balances.values())
         gno = total / 1e9 / 32  # mGwei -> mGNO -> GNO (32 mGNO = 1 GNO)
         detalle = f"{len(data)}/{len(data)} activos, saldo {gno:.4f} GNO"
 
         # margen de ruido: ignora variaciones minimas (~1 epoca de premio)
         NOISE = 200_000  # en las mismas unidades del beacon (~1e-7 GNO)
-        if prev_balance and total < prev_balance - NOISE:
+        prev_balances = prev_balances or {}
+        perdidos, barridos, perdida = [], [], 0
+        for idx, bal in balances.items():
+            prev = prev_balances.get(idx)
+            if prev is None or bal >= prev - NOISE:
+                continue
+            if _swept(bal):
+                barridos.append(idx)
+            else:
+                perdidos.append(idx)
+                perdida += prev - bal
+
+        if perdidos:
             streak = dec_streak + 1
-            perdida = (prev_balance - total) / 1e9 / 32
+            quienes = ", ".join(perdidos)
+            gno_perdido = perdida / 1e9 / 32
             if streak >= 2:
                 return ("OFFLINE",
                         f"{detalle} - saldo bajando {streak} chequeos seguidos "
-                        f"(-{perdida:.5f} GNO el ultimo)", total, streak)
-            # primera bajada: aun podria ser un retiro; avisa sin alarmar
-            return "OK", f"{detalle} - saldo bajo una vez (vigilando)", total, streak
-        return "OK", detalle, total, 0
+                        f"({quienes}; -{gno_perdido:.5f} GNO el ultimo)", balances, streak)
+            return ("OK", f"{detalle} - saldo bajo una vez en {quienes} (vigilando)",
+                    balances, streak)
+        if barridos:
+            return ("OK", f"{detalle} - retiro automatico de recompensas "
+                          f"({', '.join(barridos)})", balances, 0)
+        return "OK", detalle, balances, 0
     except Exception as e:  # noqa: BLE001
         return "UNKNOWN", f"error consultando el beacon de Gnosis ({e})", None, dec_streak
 
@@ -154,8 +215,8 @@ def save_state(state):
         f.write("\n")
 
 
-ICON = {"OK": "\U0001F7E2", "DEGRADED": "\U0001F7E1", "NOT_IN_SET": "\U0001F534",
-        "OFFLINE": "\U0001F534", "UNKNOWN": "⚪"}
+ICON = {"OK": "\U0001F7E2", "DEGRADED": "\U0001F7E1", "OUT_THIS_EPOCH": "\U0001F7E1",
+        "NOT_IN_SET": "\U0001F534", "OFFLINE": "\U0001F534", "UNKNOWN": "⚪"}
 
 
 def main():
@@ -163,8 +224,8 @@ def main():
     prev = load_state()
 
     near_state, near_detail = check_near()
-    gnosis_state, gnosis_detail, gnosis_balance, gnosis_streak = check_gnosis(
-        prev.get("gnosis_balance"), prev.get("gnosis_dec_streak", 0))
+    gnosis_state, gnosis_detail, gnosis_balances, gnosis_streak = check_gnosis(
+        prev.get("gnosis_balances"), prev.get("gnosis_dec_streak", 0))
 
     # UNKNOWN = no pudimos consultar; no es una falla del nodo. Se conserva el
     # ultimo estado conocido para no alertar por caidas de las APIs publicas.
@@ -180,7 +241,8 @@ def main():
     body = "\n".join(lines)
     print(body)
 
-    problem = near_cmp in ("DEGRADED", "NOT_IN_SET") or gnosis_cmp == "OFFLINE"
+    problem = (near_cmp in ("DEGRADED", "OUT_THIS_EPOCH", "NOT_IN_SET")
+               or gnosis_cmp == "OFFLINE")
     changed = (near_cmp != prev_near) or (gnosis_cmp != prev_gnosis)
 
     last_alert = prev.get("last_alert")
@@ -208,7 +270,7 @@ def main():
     state = {
         "near": near_cmp,
         "gnosis": gnosis_cmp,
-        "gnosis_balance": gnosis_balance if gnosis_balance else prev.get("gnosis_balance"),
+        "gnosis_balances": gnosis_balances if gnosis_balances else prev.get("gnosis_balances"),
         "gnosis_dec_streak": gnosis_streak,
         "last_alert": now.isoformat() if alerted else prev.get("last_alert", ""),
         "last_run_date": now.strftime("%Y-%m-%d"),  # cambia 1 vez al dia -> keepalive
